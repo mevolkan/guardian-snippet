@@ -1,7 +1,7 @@
 <?php
 /**
  * ============================================================
- *  WP Guardian — functions.php snippet
+ *  WordGuardHQ — functions.php snippet
  * ============================================================
  *  Drop this into your theme's functions.php if you cannot
  *  install the full plugin.  It covers:
@@ -15,8 +15,12 @@
  *    • Cron / transient / DB-table snapshots (daily)
  *    • Traffic analytics (pageviews, unique visitors, online users)
  *    • Hook capture (top fired hooks, hourly flush)
- *    • Security events (critical option changes, user events)
+ *    • Security events (critical option changes, user events, user enumeration blocking)
  *    • Server info (CPU load, disk usage)
+ *    • SSL certificate expiry check
+ *    • Security headers audit
+ *    • Referrer stats (top referrer domains, daily)
+ *    • Deprecated function / hook / doing_it_wrong logging
  *
  *  CONFIGURATION — edit the two lines below:
  */
@@ -38,7 +42,7 @@ if (
 // ── Custom cron schedule ──────────────────────────────────────────────────────
 add_filter( 'cron_schedules', function ( $schedules ) {
     if ( ! isset( $schedules['wpg_5min'] ) ) {
-        $schedules['wpg_5min'] = [ 'interval' => 300, 'display' => 'Every 5 minutes (WP Guardian)' ];
+        $schedules['wpg_5min'] = [ 'interval' => 300, 'display' => 'Every 5 minutes (WordGuardHQ)' ];
     }
     return $schedules;
 } );
@@ -53,6 +57,7 @@ $wpg_crons = [
     'wpg_snippet_flush_hooks'   => 'hourly',
     'wpg_snippet_flush_traffic' => 'hourly',
     'wpg_snippet_snapshot'      => 'daily',
+    'wpg_snippet_security_checks' => 'daily',
 ];
 foreach ( $wpg_crons as $hook => $schedule ) {
     if ( ! wp_next_scheduled( $hook ) ) {
@@ -218,6 +223,63 @@ function wpg_snippet_do_flush_logins(): void {
     wpg_snippet_ingest( [ 'login_events' => $buffer ] );
 }
 
+// ── User enumeration blocking ─────────────────────────────────────────────────
+add_action( 'template_redirect', function () {
+    if ( is_admin() ) return;
+    if ( isset( $_GET['author'] ) && is_numeric( $_GET['author'] ) ) {
+        $user_id = (int) $_GET['author'];
+        if ( get_userdata( $user_id ) ) {
+            $buffer   = get_transient( 'wpg_snippet_sec_buffer' ) ?: [];
+            $buffer[] = [
+                'event_type'  => 'user_enumeration_attempt',
+                'description' => "User enumeration attempt via ?author={$user_id}",
+                'severity'    => 'warning',
+                'details'     => [ 'probed_user_id' => $user_id, 'ip' => sanitize_text_field( $_SERVER['REMOTE_ADDR'] ?? '' ) ],
+                'timestamp'   => gmdate( 'c' ),
+            ];
+            set_transient( 'wpg_snippet_sec_buffer', $buffer, 2 * HOUR_IN_SECONDS );
+        }
+        wp_redirect( home_url( '/' ), 301 );
+        exit;
+    }
+}, 1 );
+
+// ── Deprecated function / hook / doing_it_wrong logging ──────────────────────
+add_action( 'doing_it_wrong_run', function ( $function, $message, $version ) {
+    if ( ! ( defined( 'WPG_CAPTURE_DOING_IT_WRONG' ) && WPG_CAPTURE_DOING_IT_WRONG ) ) return;
+    $buffer   = get_transient( 'wpg_snippet_log_buffer' ) ?: [];
+    $buffer[] = [
+        'level'     => 'WARNING',
+        'message'   => "doing_it_wrong: {$function}() — {$message}",
+        'source'    => 'wordpress',
+        'context'   => [ 'function' => $function, 'version' => $version ],
+        'timestamp' => gmdate( 'c' ),
+    ];
+    set_transient( 'wpg_snippet_log_buffer', $buffer, 2 * HOUR_IN_SECONDS );
+}, 10, 3 );
+add_action( 'deprecated_function_run', function ( $function, $replacement, $version ) {
+    $buffer   = get_transient( 'wpg_snippet_log_buffer' ) ?: [];
+    $buffer[] = [
+        'level'     => 'DEPRECATED',
+        'message'   => "Deprecated function: {$function}()" . ( $replacement ? " — use {$replacement}() instead" : '' ),
+        'source'    => 'wordpress',
+        'context'   => [ 'function' => $function, 'replacement' => $replacement, 'version' => $version ],
+        'timestamp' => gmdate( 'c' ),
+    ];
+    set_transient( 'wpg_snippet_log_buffer', $buffer, 2 * HOUR_IN_SECONDS );
+}, 10, 3 );
+add_action( 'deprecated_hook_run', function ( $hook, $replacement, $version, $message ) {
+    $buffer   = get_transient( 'wpg_snippet_log_buffer' ) ?: [];
+    $buffer[] = [
+        'level'     => 'DEPRECATED',
+        'message'   => "Deprecated hook: {$hook}" . ( $replacement ? " — use {$replacement} instead" : '' ),
+        'source'    => 'wordpress',
+        'context'   => [ 'hook' => $hook, 'replacement' => $replacement, 'version' => $version ],
+        'timestamp' => gmdate( 'c' ),
+    ];
+    set_transient( 'wpg_snippet_log_buffer', $buffer, 2 * HOUR_IN_SECONDS );
+}, 10, 4 );
+
 // ── Security events (critical option changes + user events) ───────────────────
 $wpg_watched_options = [ 'active_plugins', 'blogname', 'admin_email', 'users_can_register', 'default_role', 'siteurl', 'home' ];
 add_action( 'updated_option', function ( string $option ) use ( $wpg_watched_options ) {
@@ -298,10 +360,20 @@ function wpg_snippet_do_flush_hooks(): void {
 }
 
 // ── Traffic analytics ─────────────────────────────────────────────────────────
+function wpg_snippet_is_bot( string $ua ): bool {
+    if ( empty( $ua ) ) return true;
+    $bots = [ 'bot', 'crawl', 'slurp', 'spider', 'mediapartners', 'ia_archiver', 'semrush', 'ahrefs', 'mj12bot' ];
+    $ua_lower = strtolower( $ua );
+    foreach ( $bots as $fragment ) {
+        if ( strpos( $ua_lower, $fragment ) !== false ) return true;
+    }
+    return false;
+}
+
 add_action( 'wp', function () {
     if ( is_admin() || ( defined( 'DOING_CRON' ) && DOING_CRON ) ) return;
     $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
-    if ( preg_match( '/bot|crawl|slurp|spider|mediapartners/i', $ua ) ) return;
+    if ( wpg_snippet_is_bot( $ua ) ) return;
 
     // Pageviews
     $pv = (int) get_transient( 'wpg_pv_today' );
@@ -326,15 +398,47 @@ add_action( 'wp', function () {
     }
 } );
 
+// Record referrer domain counts
+add_action( 'template_redirect', function () {
+    if ( is_admin() || ( defined( 'DOING_CRON' ) && DOING_CRON ) ) return;
+    $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+    if ( wpg_snippet_is_bot( $ua ) ) return;
+
+    $referer = isset( $_SERVER['HTTP_REFERER'] ) ? esc_url_raw( $_SERVER['HTTP_REFERER'] ) : '';
+    if ( empty( $referer ) ) return;
+
+    $parsed = parse_url( $referer );
+    $domain = ! empty( $parsed['host'] ) ? strtolower( $parsed['host'] ) : '';
+    $domain = preg_replace( '/^www\./', '', $domain );
+    $self   = preg_replace( '/^www\./', '', strtolower( parse_url( home_url(), PHP_URL_HOST ) ) );
+    if ( empty( $domain ) || $domain === $self ) return;
+
+    $data            = get_transient( 'wpg_referrer_today' ) ?: [];
+    $data[ $domain ] = ( $data[ $domain ] ?? 0 ) + 1;
+    arsort( $data );
+    $data = array_slice( $data, 0, 50, true );
+    set_transient( 'wpg_referrer_today', $data, DAY_IN_SECONDS );
+} );
+
 add_action( 'wpg_snippet_flush_traffic', 'wpg_snippet_do_flush_traffic' );
 function wpg_snippet_do_flush_traffic(): void {
-    wpg_snippet_ingest( [
+    $payload = [
         'traffic' => [
             'pageviews_today' => (int) get_transient( 'wpg_pv_today' ),
             'visitors_today'  => (int) get_transient( 'wpg_visitors_today' ),
             'online_now'      => (int) get_transient( 'wpg_online_count' ),
         ],
-    ] );
+    ];
+    $referrer_data = get_transient( 'wpg_referrer_today' );
+    if ( is_array( $referrer_data ) && ! empty( $referrer_data ) ) {
+        $payload['traffic']['referrer_stats'] = array_map(
+            fn( $domain, $count ) => [ 'domain' => $domain, 'count' => $count ],
+            array_keys( $referrer_data ),
+            $referrer_data
+        );
+        delete_transient( 'wpg_referrer_today' );
+    }
+    wpg_snippet_ingest( $payload );
 }
 
 // ── Daily snapshot (crons, transients, DB tables) ─────────────────────────────
@@ -402,7 +506,7 @@ function wpg_snippet_do_uptime(): void {
     $start    = microtime( true );
     $response = wp_remote_get( home_url( '/' ), [
         'timeout'    => 10,
-        'user-agent' => 'WPGuardian-Snippet/1.0',
+        'user-agent' => 'WordGuardHQ-Snippet/1.0',
     ] );
     $ms = (int) round( ( microtime( true ) - $start ) * 1000 );
 
@@ -521,6 +625,95 @@ function wpg_snippet_quick_security_check(): array {
     return $vulns;
 }
 
+// ── Daily security checks (SSL expiry + security headers) ────────────────────
+add_action( 'wpg_snippet_security_checks', 'wpg_snippet_do_security_checks' );
+function wpg_snippet_do_security_checks(): void {
+    $checks = [];
+
+    // SSL certificate expiry
+    $ssl_status = 'warning';
+    $ssl_value  = 'Could not verify SSL certificate';
+    if ( is_ssl() || strpos( home_url(), 'https' ) === 0 ) {
+        $host    = parse_url( home_url(), PHP_URL_HOST );
+        $context = stream_context_create( [ 'ssl' => [
+            'capture_peer_cert' => true,
+            'verify_peer'       => true,
+            'verify_peer_name'  => true,
+        ] ] );
+        $stream = @stream_socket_client( "ssl://{$host}:443", $errno, $errstr, 10, STREAM_CLIENT_CONNECT, $context );
+        if ( $stream ) {
+            $params = stream_context_get_params( $stream );
+            $cert   = openssl_x509_parse( $params['options']['ssl']['peer_certificate'] );
+            fclose( $stream );
+            if ( ! empty( $cert['validTo_time_t'] ) ) {
+                $days = (int) ( ( $cert['validTo_time_t'] - time() ) / DAY_IN_SECONDS );
+                if ( $days > 30 ) {
+                    $ssl_status = 'pass';
+                    $ssl_value  = "Expires in {$days} days (" . date( 'Y-m-d', $cert['validTo_time_t'] ) . ')';
+                } elseif ( $days > 7 ) {
+                    $ssl_status = 'warning';
+                    $ssl_value  = "Expires in {$days} days — renew soon";
+                } else {
+                    $ssl_status = 'fail';
+                    $ssl_value  = $days > 0 ? "Expires in {$days} day(s) — URGENT" : 'Certificate has expired!';
+                }
+            }
+        } elseif ( $errstr ) {
+            $ssl_status = 'fail';
+            $ssl_value  = "SSL error: {$errstr}";
+        }
+    } else {
+        $ssl_status = 'warning';
+        $ssl_value  = 'Site not using HTTPS — certificate check skipped';
+    }
+    $checks[] = [
+        'id'             => 'ssl_expiry',
+        'title'          => 'SSL Certificate Expiry',
+        'status'         => $ssl_status,
+        'value'          => $ssl_value,
+        'recommendation' => 'Renew your SSL certificate before it expires.',
+        'score'          => 9,
+    ];
+
+    // Security headers
+    $head_resp = wp_remote_head( home_url( '/' ), [ 'timeout' => 8 ] );
+    $head_status  = 'warning';
+    $head_value   = 'Could not fetch response headers';
+    $missing      = [];
+    if ( ! is_wp_error( $head_resp ) ) {
+        $resp_headers = wp_remote_retrieve_headers( $head_resp );
+        foreach ( [
+            'x-frame-options'        => 'X-Frame-Options',
+            'x-content-type-options' => 'X-Content-Type-Options',
+            'referrer-policy'        => 'Referrer-Policy',
+            'permissions-policy'     => 'Permissions-Policy',
+        ] as $key => $label ) {
+            if ( empty( $resp_headers[ $key ] ) ) $missing[] = $label;
+        }
+        if ( empty( $resp_headers['content-security-policy'] ) ) $missing[] = 'Content-Security-Policy';
+        if ( empty( $missing ) ) {
+            $head_status = 'pass';
+            $head_value  = 'All required security headers present';
+        } elseif ( count( $missing ) <= 2 ) {
+            $head_status = 'warning';
+            $head_value  = 'Missing: ' . implode( ', ', $missing );
+        } else {
+            $head_status = 'fail';
+            $head_value  = 'Missing ' . count( $missing ) . ' headers: ' . implode( ', ', $missing );
+        }
+    }
+    $checks[] = [
+        'id'             => 'security_headers',
+        'title'          => 'Security Headers',
+        'status'         => $head_status,
+        'value'          => $head_value,
+        'recommendation' => 'Add X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Content-Security-Policy, and Permissions-Policy headers.',
+        'score'          => 7,
+    ];
+
+    wpg_snippet_ingest( [ 'security_checks' => $checks ] );
+}
+
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 function wpg_snippet_ingest( array $payload ): bool {
     $url      = trailingslashit( WPG_SERVER_URL ) . 'api/v1/ingest/';
@@ -535,7 +728,7 @@ function wpg_snippet_ingest( array $payload ): bool {
     ] );
 
     if ( is_wp_error( $response ) ) {
-        error_log( '[WP Guardian snippet] ' . $response->get_error_message() );
+        error_log( '[WordGuardHQ snippet] ' . $response->get_error_message() );
         return false;
     }
     return true;
