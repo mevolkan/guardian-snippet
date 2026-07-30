@@ -44,13 +44,39 @@ define( 'WPG_CAPTURE_DOING_IT_WRONG', true );
 
 ## Differences from the full plugin
 
-The snippet is intentionally lightweight — it covers all the same data as the full plugin but does not include:
+The snippet is intentionally lightweight. It sends **16 of the 23** telemetry types the full plugin
+sends. Choosing it means giving up:
 
-- WordPress core file integrity check (MD5 comparison against wordpress.org checksums)
-- Plugin CVE lookup via WPScan API
-- Settings admin page (configure via constants instead)
-- 12-point performance checklist (snippet does basic memory/DB metrics only)
-- REST API endpoint inventory
-- URL visit tracking with page-type classification
+| Not collected | Plugin payload key |
+|---|---|
+| WordPress core file integrity (checksum comparison against wordpress.org) | `core_integrity` |
+| Plugin CVE lookup via WPScan API | `plugin_cve_scan` |
+| Dedicated fatal-error capture (with backtrace, dedup hash, repeat count) | `fatal_errors` |
+| 12-point performance checklist (the snippet does basic memory/DB metrics only) | `performance_checks` |
+| REST API endpoint inventory | `rest_api_snapshot` |
+| REST API error buffer | `rest_api_errors` |
+| URL visit tracking with page-type classification | `url_visits` |
+
+It also has no settings admin page — configure via the constants above.
+
+Everything else is byte-identical in intent: both post to the same `POST /api/v1/ingest/` and both
+send only keys the server's `IngestPayload` schema declares.
 
 For full coverage, install the plugin from the `wordpress-plugin/` directory.
+
+## ⚠️ The snippet cannot be used with signed ingest
+
+The full plugin signs every request with `X-Timestamp` / `X-Nonce` / `X-Signature`
+(HMAC-SHA256 over `"{timestamp}\n{nonce}\n" + body`, keyed by the API key). **The snippet sends only
+`X-API-Key`** and relies on the server's legacy unsigned path.
+
+That path is gated by the backend's `INGEST_ENFORCE_SIGNATURE` setting (default `false`):
+
+| `INGEST_ENFORCE_SIGNATURE` | Plugin | Snippet |
+|---|---|---|
+| `false` (default) | works | works |
+| `true` | works | **401 — every request rejected** |
+
+So turning signature enforcement on is a breaking change for every snippet install. If you plan to
+enable it, migrate those sites to the plugin first. Both behaviours are covered by
+`backend/tests/test_wp_plugin_contract.py`, so this cannot regress silently.
